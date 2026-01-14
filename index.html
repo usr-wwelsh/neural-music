@@ -1,0 +1,776 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Neural Music Maker</title>
+  <style>
+    :root{font-family:Inter,system-ui,Segoe UI,Roboto,Arial;margin:0}
+    body{display:flex;flex-direction:column;gap:12px;padding:18px;background:#0b0b0d;color:#e6eef8}
+    header{display:flex;gap:8px;align-items:center}
+    h1{font-size:16px;margin:0}
+    .controls{display:flex;gap:8px;margin-left:auto}
+    button{background:#121217;border:1px solid #23232a;color:#e6eef8;padding:8px 10px;border-radius:8px;cursor:pointer;transition: background 0.2s;}
+    button.primary{background:#1e90ff;color:#001}
+    button#startBtn { transition: background 0.2s; }
+    .grid{display:grid;grid-template-columns:repeat(auto-fill, minmax(200px, 1fr));gap:12px}
+    .card{background:#0f1113;border:1px solid #1b1c20;padding:10px;border-radius:10px;min-height:120px;display:flex;flex-direction:column;justify-content:space-between}
+    .card.muted{background:#0b0b0d;border-color:#0f1113;opacity:0.7;}
+    .meta{display:flex;justify-content:space-between;align-items:center}
+    .card.active{box-shadow:0 0 0 2px #1e90ff;}
+    .slot-controls{display:flex;gap:6px}
+    .heart{cursor:pointer;padding:6px;border-radius:6px}
+    .fav{background:linear-gradient(90deg,#ff7ab6,#ffd36e);color:#001}
+    footer{margin-top:8px;font-size:13px;color:#9aa4b2}
+    .icon{width:18px;height:18px;display:inline-block}
+    label{font-size:12px}
+    .mutate-controls{display:flex;gap:8px;align-items:center}
+    .bottom-right-controls{position:fixed;bottom:18px;right:18px;display:flex;gap:8px;z-index:1000}
+    .note-controls { display: flex; gap: 12px; align-items: center; margin-bottom: 8px; }
+    .note-controls input[type="number"] { width: 60px; }
+    .note-controls input[type="range"] { width: 120px; }
+    #beat-indicator {
+      position:fixed;
+      top:10px;
+      right:10px;
+      width:12px;
+      height:12px;
+      border-radius:50%;
+      background:#1e90ff;
+      opacity:0.2;
+      transition:opacity 0.05s;
+      z-index:2000;
+    }
+    .recording-pulse {
+      animation: pulse-red 1s infinite alternate;
+    }
+    @keyframes pulse-red {
+      from { background-color: #ff4444; }
+      to { background-color: #8b0000; }
+    }
+  </style>
+  <link rel="stylesheet" href="https://unpkg.com/wavesurfer.js/dist/wavesurfer.min.css" />
+</head>
+<body>
+  <header>
+    <h1>Neural Music Maker</h1>
+    <div class="controls">
+      <button id="startBtn" class="primary">Start Audio</button>
+      <button id="breedBtn">Breed</button>
+      <button id="saveBtn">Save Bank</button>
+      <button id="loadBtn">Load Bank</button>
+    </div>
+    <div class="bottom-right-controls">
+      <button id="selectAllBtn">Select All</button>
+      <button id="selectNoneBtn">Select None</button>
+    </div>
+  </header>
+  <section>
+    <div style="display:flex;gap:12px;align-items:center;margin-bottom:8px">
+      <label>Generation size:</label>
+      <input id="genSize" type="number" min="1" max="16" value="8" />
+      <label>Mutation strength</label>
+      <input id="mutStrength" type="range" min="0.1" max="3" step="0.1" value="1" />
+    </div>
+    <div class="note-controls">
+      <label>Min Note:</label>
+      <input id="minNote" type="number" min="24" max="84" value="48" />
+      <input id="minNoteSlider" type="range" min="24" max="84" value="48" />
+      <label>Max Note:</label>
+      <input id="maxNote" type="number" min="24" max="84" value="72" />
+      <input id="maxNoteSlider" type="range" min="24" max="84" value="72" />
+    </div>
+    <div class="note-controls">
+      <label>Tempo:</label>
+      <input id="tempoFader" type="range" min="60" max="200" value="120" />
+      <label>Pitch:</label>
+      <input id="pitchFader" type="range" min="-1200" max="1200" value="0" />
+    </div>
+    <div class="grid" id="grid"></div>
+  </section>
+  <footer>
+    Click a card's heart to favorite it. Pins seed the next generation when you press Breed. 
+    Each card loops while active. Saved banks are stored in localStorage.
+  </footer>
+  <div id="beat-indicator"></div>
+
+<div id="daw" style="border-top:1px solid #23232a;padding:12px;background:#0b0b0d;color:#e6eef8;">
+  <button id="recordBtn">Record</button>
+  <button id="stopRecordBtn" disabled>Stop</button>
+  <button id="playbackBtn" disabled>Play</button>
+  <button id="cropBtn" disabled>Crop Selection</button>
+  <button id="saveRecordingBtn" disabled>Save MP3</button>
+  <div id="waveform" style="margin-top:12px;"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/tone@14.8.39/build/Tone.js"></script>
+<script src="https://unpkg.com/wavesurfer.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.0/lame.min.js"></script>
+<script>
+const DEFAULT_GEN_SIZE = 8;
+let GEN_SIZE = DEFAULT_GEN_SIZE;
+let MUT_STRENGTH = 1.0;
+let MIN_NOTE = 48;
+let MAX_NOTE = 72;
+let GLOBAL_TEMPO = 120;
+let GLOBAL_PITCH_ADJUST = 0;
+let slots = [];
+let favorites = new Set();
+let pinned = new Set();
+let instances = {};
+let started = false;
+let allMuted = false;
+let pitchShiftEffect;
+let audioInitialized = false;
+
+// Detect device capabilities
+const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+
+// Configure Tone.js for better cross-device compatibility
+Tone.context.latencyHint = isMobile ? 'balanced' : 'interactive';
+Tone.context.lookAhead = isMobile ? 0.1 : 0.05;
+
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+
+/* --- Genome helpers --- */
+function makeRandomGenome() {
+  return {
+    osc: ['metal','sine','sawtooth','square','triangle'][Math.floor(Math.random()*5)],
+    baseNote: MIN_NOTE + Math.floor(Math.random()*(MAX_NOTE - MIN_NOTE + 1)),
+    seq: Array.from({length:4+Math.floor(Math.random()*8)},()=>Math.floor(rand(-12,12))),
+    bpm: [60,70,80,90,100,110,120,140,160][Math.floor(Math.random()*9)],
+    loopBars: [1,2,4][Math.floor(Math.random()*3)],
+    filterCutoff: Math.round(rand(200,8000)),
+    filterQ: parseFloat(rand(0.2,10).toFixed(2)),
+    ampEnv:{
+      attack:parseFloat(rand(0.001,0.2).toFixed(3)),
+      decay:parseFloat(rand(0.1,0.8).toFixed(2)),
+      sustain:parseFloat(rand(0.2,0.8).toFixed(2)),
+      release:parseFloat(rand(0.1,1.5).toFixed(2))
+    },
+    reverbWet:parseFloat(rand(0,0.5).toFixed(2)),
+    delayWet:parseFloat(rand(0,0.3).toFixed(2)),
+    delayFeedback:parseFloat(rand(0.2,0.7).toFixed(2)),
+    distortionWet:parseFloat(rand(0,0.2).toFixed(2)),
+    chorusWet:parseFloat(rand(0,0.3).toFixed(2)),
+    phaserWet:parseFloat(rand(0,0.2).toFixed(2)),
+    lfoRate:parseFloat(rand(0.05,10).toFixed(3)),
+    lfoDepth:parseFloat(rand(0,1).toFixed(2)),
+    lfoType:['sine','triangle','sawtooth','square'][Math.floor(Math.random()*4)],
+    lfoDestination:['filterCutoff','synthVolume','synthPitch'][Math.floor(Math.random()*3)],
+    harmonicity:parseFloat(rand(1,8).toFixed(2)),
+    modulationIndex:parseFloat(rand(1,32).toFixed(2)),
+    resonance:parseFloat(rand(100,4000).toFixed(2)),
+    octaves:parseFloat(rand(0.5,4).toFixed(2))
+  };
+}
+
+function mutateGenome(g,strength=1.0){
+  try{
+    const s=Math.max(0.05,strength);
+    const out=JSON.parse(JSON.stringify(g));
+    out.baseNote=Math.round(clamp(out.baseNote+(Math.random()*2-1)*12*s,MIN_NOTE,MAX_NOTE));
+    out.seq=out.seq.map(i=>Math.round(i+(Math.random()*2-1)*6*s));
+    if(Math.random()<0.1) out.seq=Array.from({length:3+Math.floor(Math.random()*8)},()=>Math.floor(rand(-24,24)));
+    return out;
+  }catch(e){
+    console.error("mutateGenome error",e);
+    return makeRandomGenome();
+  }
+}
+
+/* --- Tone.js instance mgmt --- */
+function createInstance(genome,slotId){
+  try{
+    let synth;
+    const filter=new Tone.Filter(genome.filterCutoff,"lowpass");
+
+    // Reduce reverb decay on mobile for better performance
+    const reverb=new Tone.Reverb({
+      decay: isMobile ? 1.5 : 2,
+      wet: genome.reverbWet,
+      preDelay: 0.01
+    });
+
+    const delay=new Tone.FeedbackDelay({
+      delayTime:"8n",
+      feedback:genome.delayFeedback,
+      wet:genome.delayWet,
+      maxDelay: isMobile ? 0.5 : 1
+    });
+
+    const distortion=new Tone.Distortion({
+      distortion:0.5,
+      wet:genome.distortionWet,
+      oversample: isMobile ? 'none' : '2x'
+    });
+
+    const chorus=new Tone.Chorus({
+      frequency:1.5,
+      delayTime:2.5,
+      depth:0.7,
+      wet:genome.chorusWet
+    });
+
+    const phaser=new Tone.Phaser({
+      frequency:0.5,
+      octaves:3,
+      baseFrequency:300,
+      wet:genome.phaserWet
+    });
+
+    if(genome.osc==='metal'){
+      synth=new Tone.MetalSynth({
+        frequency:Tone.Frequency(genome.baseNote,'midi').toFrequency(),
+        envelope:genome.ampEnv,
+        harmonicity:genome.harmonicity,
+        modulationIndex:genome.modulationIndex,
+        resonance:genome.resonance,
+        octaves:genome.octaves,
+        volume:-10
+      });
+    }else{
+      synth=new Tone.PolySynth(Tone.Synth,{
+        oscillator:{type:genome.osc},
+        envelope:genome.ampEnv,
+        maxPolyphony: isMobile ? 8 : 32,
+        volume: -6
+      });
+    }
+
+    // Chain effects to pitch shift (which is already connected to destination)
+    synth.chain(filter,distortion,chorus,phaser,delay,reverb,pitchShiftEffect);
+
+    const seq=new Tone.Sequence((time,step)=>{
+      const interval=genome.seq[step%genome.seq.length]||0;
+      const midi=clamp(genome.baseNote+interval, 0, 127);
+      const dur=genome.osc==='metal'?'32n':'8n';
+
+      try {
+        const freq=Tone.Frequency(midi,'midi').toFrequency();
+        if(genome.osc==='metal') {
+          synth.triggerAttackRelease(freq,dur,time);
+        } else {
+          synth.triggerAttackRelease(freq,dur,time,0.6);
+        }
+      } catch(e) {
+        console.warn('Note trigger error:', e);
+      }
+    },Array.from({length:genome.seq.length},(_,i)=>i),'16n');
+
+    Tone.Transport.bpm.value=GLOBAL_TEMPO;
+    Tone.Transport.loop=true;
+    Tone.Transport.loopStart=0;
+    Tone.Transport.loopEnd=`${genome.loopBars}m`;
+    seq.start(0);
+
+    instances[slotId]={synth,filter,reverb,delay,distortion,chorus,phaser,seq,genome};
+  }catch(e){
+    console.error("createInstance error",e);
+  }
+}
+
+function stopInstance(slotId){
+  const inst=instances[slotId];
+  if(!inst) return;
+  try{
+    // Stop and dispose in proper order
+    if(inst.seq) {
+      inst.seq.stop();
+      inst.seq.dispose();
+    }
+    if(inst.synth) inst.synth.dispose();
+    if(inst.filter) inst.filter.dispose();
+    if(inst.reverb) inst.reverb.dispose();
+    if(inst.delay) inst.delay.dispose();
+    if(inst.distortion) inst.distortion.dispose();
+    if(inst.chorus) inst.chorus.dispose();
+    if(inst.phaser) inst.phaser.dispose();
+  }catch(e){
+    console.error("stopInstance error",e);
+  }
+  delete instances[slotId];
+}
+
+/* --- UI rendering --- */
+const grid=document.getElementById('grid');
+function makeCard(slotIndex,genome){
+  const el=document.createElement('div');
+  el.className='card '+(allMuted?'muted':'active');
+  el.dataset.slot=slotIndex;
+  const title=document.createElement('div');
+  title.innerHTML=`<strong>Slot ${slotIndex+1}</strong>`;
+  const mid=document.createElement('div');
+  mid.style.fontSize='12px';
+  mid.textContent=`${genome.osc} | base ${genome.baseNote} | len ${genome.loopBars} bars`;
+  const meta=document.createElement('div');
+  meta.className='meta';
+  const controls=document.createElement('div');
+  controls.className='slot-controls';
+  const heart=document.createElement('button');
+  heart.className='heart';
+  heart.innerHTML=favorites.has(slotIndex)?'♥':'♡';
+  if(favorites.has(slotIndex)) heart.classList.add('fav');
+  heart.onclick=(e)=>{e.stopPropagation();toggleFavorite(slotIndex,el,heart);}
+  const pin=document.createElement('button');
+  pin.className='heart';
+  pin.innerHTML=pinned.has(slotIndex)?'📍':'📌';
+  pin.onclick=(e)=>{e.stopPropagation();togglePin(slotIndex,el);}
+  controls.appendChild(heart);controls.appendChild(pin);meta.appendChild(controls);
+  el.append(title,mid,meta);
+  el.onclick=async ()=>{
+    // Ensure audio is started on mobile
+    if(!started){
+      await startAudio();
+    }
+    // Resume audio context if suspended (important for mobile)
+    if(Tone.context.state !== 'running'){
+      await Tone.context.resume();
+    }
+
+    if(allMuted){allMuted=false;createInstance(genome,slotIndex);el.classList.replace('muted','active');}
+    else{if(instances[slotIndex]){stopInstance(slotIndex);el.classList.replace('active','muted');}
+         else{createInstance(genome,slotIndex);el.classList.replace('muted','active');}}
+  };
+  return el;
+}
+
+function toggleFavorite(i,cardEl,heartBtn){if(favorites.has(i)){favorites.delete(i);heartBtn.innerHTML='♡';heartBtn.classList.remove('fav');}else{favorites.add(i);heartBtn.innerHTML='♥';heartBtn.classList.add('fav');}}
+function togglePin(i,cardEl){if(pinned.has(i)){pinned.delete(i);cardEl.style.boxShadow='';}else{pinned.add(i);cardEl.style.boxShadow='0 0 0 2px rgba(255,190,80,0.09)';}}
+function renderGrid(){grid.innerHTML='';for(let i=0;i<GEN_SIZE;i++){const g=slots[i]||makeRandomGenome();slots[i]=g;grid.appendChild(makeCard(i,g));}}
+
+/* --- Transport controls --- */
+const startBtn=document.getElementById('startBtn');
+async function startAudio(){
+  if(!started){
+    try {
+      // Ensure audio context is in a good state
+      await Tone.start();
+
+      // Resume audio context explicitly (important for mobile)
+      if (Tone.context.state !== 'running') {
+        await Tone.context.resume();
+      }
+
+      // Additional iOS-specific unlock
+      if(isIOS){
+        const buffer = Tone.context.createBuffer(1, 1, 22050);
+        const source = Tone.context.createBufferSource();
+        source.buffer = buffer;
+        source.connect(Tone.context.destination);
+        source.start(0);
+      }
+
+      // Wait a bit for context to stabilize
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      // Initialize pitch shift effect BEFORE starting transport
+      pitchShiftEffect = new Tone.PitchShift({
+        pitch: GLOBAL_PITCH_ADJUST,
+        windowSize: 0.1,
+        delayTime: 0,
+        feedback: 0
+      }).toDestination();
+
+      // Set transport settings
+      Tone.Transport.bpm.value = GLOBAL_TEMPO;
+      Tone.Transport.loop = true;
+      Tone.Transport.loopStart = 0;
+
+      // Start transport
+      Tone.Transport.start('+0.1');
+
+      // Create instances after transport is running
+      if(!allMuted){
+        for(let i=0;i<GEN_SIZE;i++){
+          createInstance(slots[i],i);
+        }
+      }
+
+      startBtn.textContent='RESET';
+      startBtn.classList.remove('primary');
+      startBtn.style.background='#ff4444';
+      started=true;
+      audioInitialized=true;
+
+    } catch(e) {
+      console.error("Audio init error",e);
+      alert('Audio initialization failed. Please try again. Error: ' + e.message);
+    }
+  }else{
+    Tone.Transport.stop();
+    Tone.Transport.cancel();
+    for(const k in instances) stopInstance(k);
+    instances={};
+    slots=Array.from({length:GEN_SIZE},()=>makeRandomGenome());
+    renderGrid();
+    started=false;
+    audioInitialized=false;
+    startBtn.textContent='Start Audio';
+    startBtn.classList.add('primary');
+    startBtn.style.background='';
+    if(pitchShiftEffect){
+      pitchShiftEffect.disconnect();
+      pitchShiftEffect.dispose();
+      pitchShiftEffect=null;
+    }
+  }
+}
+
+async function breed(){
+  try{
+    if(!started) {
+      alert('Please start audio first');
+      return;
+    }
+    // Resume audio context if suspended (important for mobile)
+    if(Tone.context.state !== 'running'){
+      await Tone.context.resume();
+    }
+
+    const strength=parseFloat(MUT_STRENGTH);
+    const parents=Array.from(favorites).length?Array.from(favorites):[Math.floor(Math.random()*GEN_SIZE)];
+    const activeStates={};
+    for(let i=0;i<GEN_SIZE;i++){activeStates[i]=!!instances[i];}
+    const newSlots=[];
+    for(let i=0;i<GEN_SIZE;i++){
+      if(pinned.has(i)&&slots[i]){
+        newSlots[i]=slots[i];
+        continue;
+      }
+      const p=parents[Math.floor(Math.random()*parents.length)];
+      const child=mutateGenome(slots[p]||makeRandomGenome(),strength);
+      newSlots[i]=child;
+    }
+
+    for(const k in instances) stopInstance(k);
+    slots=newSlots;
+    favorites.clear();
+    renderGrid();
+
+    for(let i=0;i<GEN_SIZE;i++){
+      const card=grid.querySelector(`[data-slot="${i}"]`);
+      if(card){
+        if(activeStates[i]&&!allMuted){
+          createInstance(slots[i],i);
+          card.classList.replace('muted','active');
+        }else{
+          card.classList.replace('active','muted');
+        }
+      }
+    }
+  }catch(e){
+    console.error("breed error",e);
+    alert('Breed failed: ' + e.message);
+  }
+}
+
+let breedScheduledId = null;
+
+function scheduleBreed() {
+  try {
+    MUT_STRENGTH = parseFloat(mutStrengthEl.value);
+
+    // Pre-generate new genomes
+    const strength = MUT_STRENGTH;
+    const parents = favorites.size ? Array.from(favorites) : [Math.floor(Math.random() * GEN_SIZE)];
+    const newSlots = [];
+    for (let i = 0; i < GEN_SIZE; i++) {
+      if (pinned.has(i) && slots[i]) {
+        newSlots[i] = slots[i];
+      } else {
+        const p = parents[Math.floor(Math.random() * parents.length)];
+        newSlots[i] = mutateGenome(slots[p] || makeRandomGenome(), strength);
+      }
+    }
+
+    // Cancel previous scheduled breed if any
+    if (breedScheduledId !== null) {
+      Tone.Transport.clear(breedScheduledId);
+    }
+
+    // Schedule swap slightly ahead of next bar to avoid missing window
+    breedScheduledId = Tone.Transport.scheduleOnce(() => {
+      // Kill old
+      for (const k in instances) stopInstance(k);
+      // Replace genomes
+      slots = newSlots;
+      favorites.clear();
+      renderGrid();
+      // Start new
+      if (!allMuted) {
+        for (let i = 0; i < GEN_SIZE; i++) {
+          createInstance(slots[i], i);
+        }
+      }
+      breedScheduledId = null; // reset
+    }, `+0.01m`); // 0.01 measures ahead ensures schedule is always in the future
+
+  } catch (e) {
+    console.error("scheduleBreed error", e);
+  }
+}
+
+
+function saveBank(){
+  try{
+    const data={genomes:slots,favorites:Array.from(favorites),pinned:Array.from(pinned)};
+    localStorage.setItem('emm_saved',JSON.stringify(data));
+    alert('Bank saved.');
+  }catch(e){console.error("saveBank error",e);alert('Save failed');}
+}
+
+function loadBank(){
+  try{
+    const raw=localStorage.getItem('emm_saved');if(!raw){alert('No saved bank');return;}
+    const data=JSON.parse(raw);
+    slots=data.genomes||[];favorites=new Set(data.favorites||[]);pinned=new Set(data.pinned||[]);
+    for(const k in instances) stopInstance(k);
+    renderGrid();
+  }catch(e){console.error("loadBank error",e);alert('Load failed');}
+}
+
+/* --- Select helpers --- */
+async function selectAll(){
+  if(!started) await startAudio();
+  if(Tone.context.state !== 'running') await Tone.context.resume();
+  allMuted=false;for(let i=0;i<GEN_SIZE;i++){if(!instances[i]) createInstance(slots[i],i);}renderGrid();
+}
+async function selectNone(){
+  allMuted=true;for(const k in instances) stopInstance(k);renderGrid();
+}
+
+/* --- Beat indicator --- */
+const beatEl=document.getElementById('beat-indicator');
+Tone.Transport.scheduleRepeat((time)=>{beatEl.style.opacity=1;setTimeout(()=>beatEl.style.opacity=0.2,100);},"4n");
+
+/* --- Hook UI --- */
+const breedBtn=document.getElementById('breedBtn');
+const saveBtn=document.getElementById('saveBtn');
+const loadBtn=document.getElementById('loadBtn');
+const genSizeEl=document.getElementById('genSize');
+const mutStrengthEl=document.getElementById('mutStrength');
+const minNoteEl=document.getElementById('minNote');
+const maxNoteEl=document.getElementById('maxNote');
+const minNoteSlider=document.getElementById('minNoteSlider');
+const maxNoteSlider=document.getElementById('maxNoteSlider');
+const tempoFader=document.getElementById('tempoFader');
+const pitchFader=document.getElementById('pitchFader');
+const selectAllBtn=document.getElementById('selectAllBtn');
+const selectNoneBtn=document.getElementById('selectNoneBtn');
+
+startBtn.onclick=async ()=>{
+  await startAudio();
+};
+breedBtn.onclick=async ()=>{
+  // Resume context before breeding
+  if(Tone.context.state !== 'running') await Tone.context.resume();
+  scheduleBreed();
+};
+saveBtn.onclick=saveBank;
+loadBtn.onclick=loadBank;
+genSizeEl.oninput=()=>{GEN_SIZE=parseInt(genSizeEl.value)||DEFAULT_GEN_SIZE;slots=Array.from({length:GEN_SIZE},()=>makeRandomGenome());renderGrid();}
+mutStrengthEl.oninput=()=>MUT_STRENGTH=parseFloat(mutStrengthEl.value)||1.0;
+minNoteEl.oninput=()=>{MIN_NOTE=parseInt(minNoteEl.value)||48;minNoteSlider.value=MIN_NOTE;}
+maxNoteEl.oninput=()=>{MAX_NOTE=parseInt(maxNoteEl.value)||72;maxNoteSlider.value=MAX_NOTE;}
+minNoteSlider.oninput=()=>{MIN_NOTE=parseInt(minNoteSlider.value)||48;minNoteEl.value=MIN_NOTE;}
+maxNoteSlider.oninput=()=>{MAX_NOTE=parseInt(maxNoteSlider.value)||72;maxNoteEl.value=MAX_NOTE;}
+tempoFader.oninput=()=>{GLOBAL_TEMPO=parseInt(tempoFader.value)||120;Tone.Transport.bpm.value=GLOBAL_TEMPO;}
+pitchFader.oninput=()=>{GLOBAL_PITCH_ADJUST=parseInt(pitchFader.value)||0;if(pitchShiftEffect) pitchShiftEffect.pitch=GLOBAL_PITCH_ADJUST;}
+selectAllBtn.onclick=selectAll;
+selectNoneBtn.onclick=selectNone;
+
+slots=Array.from({length:GEN_SIZE},()=>makeRandomGenome());
+renderGrid();
+let recordedChunks = [], audioBlob;
+let mediaRecorder, mediaStreamDestination;
+let wavesurfer, startCrop = 0, endCrop = 0;
+
+// Create Wavesurfer
+wavesurfer = WaveSurfer.create({
+  container: '#waveform',
+  waveColor: '#1e90ff',
+  progressColor: '#ff4444',
+  height: 80
+});
+
+// Buttons
+const recordBtn = document.getElementById('recordBtn');
+const stopRecordBtn = document.getElementById('stopRecordBtn');
+const playbackBtn = document.getElementById('playbackBtn');
+const cropBtn = document.getElementById('cropBtn');
+const saveRecordingBtn = document.getElementById('saveRecordingBtn');
+
+recordBtn.onclick = async () => {
+  if (!started) { alert('Start your audio first!'); return; }
+
+  try {
+    // Hook Tone.js master output to MediaStream
+    mediaStreamDestination = Tone.context.createMediaStreamDestination();
+    Tone.Destination.connect(mediaStreamDestination);
+
+    // Detect supported MIME types for better compatibility
+    let mimeType = 'audio/webm';
+    if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+      mimeType = 'audio/webm;codecs=opus';
+    } else if (MediaRecorder.isTypeSupported('audio/webm')) {
+      mimeType = 'audio/webm';
+    } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+      mimeType = 'audio/mp4';
+    } else if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) {
+      mimeType = 'audio/ogg;codecs=opus';
+    }
+
+    mediaRecorder = new MediaRecorder(mediaStreamDestination.stream, {
+      mimeType: mimeType,
+      audioBitsPerSecond: isMobile ? 96000 : 128000
+    });
+
+    recordedChunks = [];
+    mediaRecorder.ondataavailable = e => { if(e.data.size > 0) recordedChunks.push(e.data); };
+    mediaRecorder.onstop = async () => {
+      try {
+        const rawBlob = new Blob(recordedChunks, { type: mimeType });
+        const url = URL.createObjectURL(rawBlob);
+
+        // Convert to MP3 immediately after recording
+        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        const arrayBuffer = await rawBlob.arrayBuffer();
+        const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+
+        // Get audio data and convert to MP3
+        const channelData = audioBuffer.getChannelData(0);
+        audioBlob = float32ToMP3(channelData, audioBuffer.sampleRate);
+
+        // Load the MP3 into wavesurfer
+        wavesurfer.load(URL.createObjectURL(audioBlob));
+        playbackBtn.disabled = false;
+        cropBtn.disabled = false;
+        saveRecordingBtn.disabled = false;
+      } catch(e) {
+        console.error('Recording conversion error:', e);
+        alert('Could not convert recording to MP3: ' + e.message);
+      }
+    };
+    mediaRecorder.onerror = (e) => {
+      console.error('MediaRecorder error:', e);
+      alert('Recording error: ' + (e.error ? e.error.message : 'Unknown error'));
+      recordBtn.disabled = false;
+      stopRecordBtn.disabled = true;
+      recordBtn.classList.remove('recording-pulse');
+    };
+
+    mediaRecorder.start(isMobile ? 1000 : 100); // Larger timeslice on mobile
+    recordBtn.disabled = true;
+    stopRecordBtn.disabled = false;
+    recordBtn.classList.add('recording-pulse');
+  } catch(e) {
+    console.error('Recording start error:', e);
+    alert('Could not start recording: ' + e.message);
+  }
+};
+
+stopRecordBtn.onclick = () => {
+  if(mediaRecorder && mediaRecorder.state === "recording") mediaRecorder.stop();
+  recordBtn.disabled = false;
+  stopRecordBtn.disabled = true;
+  recordBtn.classList.remove('recording-pulse');
+};
+
+playbackBtn.onclick = () => {
+  if (wavesurfer.isPlaying()) wavesurfer.pause();
+  else wavesurfer.play();
+};
+
+// Crop selection
+wavesurfer.on('ready', () => {
+  wavesurfer.enableDragSelection({ color: 'rgba(255,190,80,0.3)' });
+  wavesurfer.on('region-update-end', region => {
+    startCrop = region.start;
+    endCrop = region.end;
+  });
+});
+
+cropBtn.onclick = () => {
+  if (!audioBlob) return alert('Record something first');
+  if (!startCrop && !endCrop) return alert('Please select a region to crop');
+
+  try {
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    const fileReader = new FileReader();
+    fileReader.onload = async e => {
+      try {
+        const arrayBuffer = e.target.result;
+        const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+        const startSample = Math.floor(startCrop * audioBuffer.sampleRate);
+        const endSample = Math.floor(endCrop * audioBuffer.sampleRate);
+
+        // Handle stereo if available
+        const numChannels = audioBuffer.numberOfChannels;
+        const cropped = audioBuffer.getChannelData(0).slice(startSample, endSample);
+
+        const newBuffer = audioContext.createBuffer(1, cropped.length, audioBuffer.sampleRate);
+        newBuffer.copyToChannel(cropped, 0);
+
+        const exportArray = new Float32Array(newBuffer.length);
+        newBuffer.copyFromChannel(exportArray, 0);
+
+        audioBlob = float32ToMP3(exportArray, newBuffer.sampleRate);
+        wavesurfer.load(URL.createObjectURL(audioBlob));
+      } catch(e) {
+        console.error('Crop processing error:', e);
+        alert('Could not process crop: ' + e.message);
+      }
+    };
+    fileReader.onerror = (e) => {
+      console.error('FileReader error:', e);
+      alert('Could not read audio file');
+    };
+    fileReader.readAsArrayBuffer(audioBlob);
+  } catch(e) {
+    console.error('Crop error:', e);
+    alert('Could not crop audio: ' + e.message);
+  }
+};
+
+saveRecordingBtn.onclick = () => {
+  if (!audioBlob) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(audioBlob);
+  a.download = 'recording.mp3';
+  a.click();
+};
+
+// Convert Float32 to MP3
+function float32ToMP3(float32Array, sampleRate) {
+  try {
+    const mp3Encoder = new lamejs.Mp3Encoder(1, sampleRate, 128);
+    const blockSize = 1152;
+    let mp3Data = [];
+
+    for (let i = 0; i < float32Array.length; i += blockSize) {
+      const slice = float32Array.subarray(i, Math.min(i + blockSize, float32Array.length));
+      // Convert Float32 to Int16 with proper clamping
+      const buf = new Int16Array(slice.length);
+      for (let j = 0; j < slice.length; j++) {
+        const s = Math.max(-1, Math.min(1, slice[j]));
+        buf[j] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      const mp3buf = mp3Encoder.encodeBuffer(buf);
+      if (mp3buf && mp3buf.length > 0) mp3Data.push(mp3buf);
+    }
+
+    const mp3buf = mp3Encoder.flush();
+    if (mp3buf && mp3buf.length > 0) mp3Data.push(mp3buf);
+
+    return new Blob(mp3Data, { type: 'audio/mp3' });
+  } catch(e) {
+    console.error('MP3 encoding error:', e);
+    throw new Error('Failed to encode MP3: ' + e.message);
+  }
+}
+</script>
+</body>
+</html>
